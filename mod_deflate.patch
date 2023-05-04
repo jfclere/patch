@@ -1,0 +1,160 @@
+Index: modules/filters/mod_deflate.c
+===================================================================
+--- modules/filters/mod_deflate.c	(revision 1909138)
++++ modules/filters/mod_deflate.c	(working copy)
+@@ -57,6 +57,10 @@
+ #define AP_INFLATE_RATIO_LIMIT 200
+ #define AP_INFLATE_RATIO_BURST 3
+ 
++#define AP_DEFLATE_ETAG_ADDSUFFIX 0
++#define AP_DEFLATE_ETAG_NOCHANGE  1
++#define AP_DEFLATE_ETAG_REMOVE    2
++
+ typedef struct deflate_filter_config_t
+ {
+     int windowSize;
+@@ -66,6 +70,7 @@
+     const char *note_ratio_name;
+     const char *note_input_name;
+     const char *note_output_name;
++    int etag_opt;
+ } deflate_filter_config;
+ 
+ typedef struct deflate_dirconf_t {
+@@ -295,6 +300,29 @@
+     return NULL;
+ }
+ 
++static const char *deflate_set_etag(cmd_parms *cmd, void *dummy,
++                                        const char *arg)
++{
++    deflate_filter_config *c = ap_get_module_config(cmd->server->module_config,
++                                                    &deflate_module);
++
++    if (!strcasecmp(arg, "NoChange")) { 
++      c->etag_opt = AP_DEFLATE_ETAG_NOCHANGE;
++    }
++    else if (!strcasecmp(arg, "AddSuffix")) { 
++      c->etag_opt = AP_DEFLATE_ETAG_ADDSUFFIX;
++    }
++    else if (!strcasecmp(arg, "Remove")) { 
++      c->etag_opt = AP_DEFLATE_ETAG_REMOVE;
++    }
++    else { 
++        return "DeflateAlterETAG accepts only 'NoChange', 'AddSuffix', and 'Remove'";
++    }
++
++    return NULL;
++}
++
++
+ static const char *deflate_set_compressionlevel(cmd_parms *cmd, void *dummy,
+                                         const char *arg)
+ {
+@@ -464,11 +492,16 @@
+  * value inside the double-quotes if an ETag has already been set
+  * and its value already contains double-quotes. PR 39727
+  */
+-static void deflate_check_etag(request_rec *r, const char *transform)
++static void deflate_check_etag(request_rec *r, const char *transform, int etag_opt)
+ {
+     const char *etag = apr_table_get(r->headers_out, "ETag");
+     apr_size_t etaglen;
+ 
++    if (etag_opt == AP_DEFLATE_ETAG_REMOVE) { 
++        apr_table_unset(r->headers_out, "ETag");
++        return;
++    }
++
+     if ((etag && ((etaglen = strlen(etag)) > 2))) {
+         if (etag[etaglen - 1] == '"') {
+             apr_size_t transformlen = strlen(transform);
+@@ -809,7 +842,9 @@
+         }
+         apr_table_unset(r->headers_out, "Content-Length");
+         apr_table_unset(r->headers_out, "Content-MD5");
+-        deflate_check_etag(r, "gzip");
++        if (c->etag_opt != AP_DEFLATE_ETAG_NOCHANGE) {  
++            deflate_check_etag(r, "gzip", c->etag_opt);
++        }
+ 
+         /* For a 304 response, only change the headers */
+         if (r->status == HTTP_NOT_MODIFIED) {
+@@ -1566,7 +1601,9 @@
+          */
+         apr_table_unset(r->headers_out, "Content-Length");
+         apr_table_unset(r->headers_out, "Content-MD5");
+-        deflate_check_etag(r, "gunzip");
++        if (c->etag_opt != AP_DEFLATE_ETAG_NOCHANGE) {
++            deflate_check_etag(r, "gunzip", c->etag_opt);
++        }
+ 
+         /* For a 304 response, only change the headers */
+         if (r->status == HTTP_NOT_MODIFIED) {
+@@ -1922,6 +1959,9 @@
+     AP_INIT_TAKE1("DeflateInflateRatioBurst", deflate_set_inflate_ratio_burst, NULL, OR_ALL,
+                   "Set the maximum number of following inflate ratios above limit "
+                   "(default: " APR_STRINGIFY(AP_INFLATE_RATIO_BURST) ")"),
++   AP_INIT_TAKE1("DeflateAlterEtag", deflate_set_etag, NULL, RSRC_CONF,
++                  "Set how mod_deflate should modify ETAG response headers: 'AddSuffix' (default), 'NoChange' (2.2.x behavior), 'Remove'"),
++
+     {NULL}
+ };
+ 
+Index: docs/manual/mod/mod_deflate.xml
+===================================================================
+--- docs/manual/mod/mod_deflate.xml	(revision 1909138)
++++ docs/manual/mod/mod_deflate.xml	(working copy)
+@@ -207,7 +207,37 @@
+     RewriteRule "\.css\.gz$" "-" [T=text/css,E=no-gzip:1]
+     RewriteRule "\.js\.gz$"  "-" [T=text/javascript,E=no-gzip:1]
+ 
++<directivesynopsis>
++<name>DeflateAlterETag</name>
++<description>How the outgoing ETag header should be modified during compression</description>
++<syntax>DeflateAlterETag AddSuffix|NoChange|Remove</syntax>
++<default>DeflateAlterETag AddSuffix</default>
++<contextlist><context>server config</context><context>virtual host</context>
++</contextlist>
+ 
++<usage>
++    <p>The <directive>DeflateAlterETag</directive> directive specifies
++    how the ETag hader should be altered when a response is compressed.</p>
++    <dl>
++    <dt>AddSuffix</dt>
++    <dd><p>Append the compression method onto the end of the ETag, causing 
++        compressed and uncompressed representatins to have unique ETags.  
++        This has been the default since 2.4.0, but prevents serving 
++        "HTTP Not Modified" (304) responses to conditional requests for 
++        compressed content.</p></dd>
++    <dt>NoChange</dt>
++    <dd><p>Don't change the ETag on a compressed response. This was the default
++        prior to 2.4.0, but does not satisfy the HTTP/1.1 property that all
++        representations of the same resource have unique ETags </p></dd>
++    <dt>Remove</dt>
++    <dd><p>Remove the ETag header from compressed responses. This prevents 
++        some conditional requests from being possible, but avoids the 
++        shortcomings of the preceding options.  </p></dd>
++    </dl>
++</usage>
++</directivesynopsis>
++
++
+     &lt;FilesMatch "(\.js\.gz|\.css\.gz)$"&gt;
+       # Serve correct encoding type.
+       Header append Content-Encoding gzip
+Index: CHANGES
+===================================================================
+--- CHANGES	(revision 1909138)
++++ CHANGES	(working copy)
+@@ -4055,6 +4055,10 @@
+   *) mod_ssl: avoid processing bogus SSLCertificateKeyFile values
+      (and logging garbled file names). PR 56306. [Kaspar Brand]
+ 
++  *) mod_deflate: Add DeflateAlterETag to control how the ETag
++     is modified. The 'NoChange' parameter mimics 2.2.x behavior.
++     PR 45023, PR 39727. [Eric Covener]
++
+   *) mod_ssl: fix merging of global and vhost-level settings with the
+      SSLCertificateFile, SSLCertificateKeyFile, and SSLOpenSSLConfCmd
+      directives. PR 56353. [Kaspar Brand]
